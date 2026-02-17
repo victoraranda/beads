@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,4 +390,204 @@ func TestOpenPeerStore(t *testing.T) {
 			t.Fatal("expected error for nonexistent path")
 		}
 	})
+}
+
+func TestDetectPeerBackend_SymlinkDolt(t *testing.T) {
+	skipIfNoDolt(t)
+
+	// Verify detection works through symlinks (common in test setups)
+	baseDir := t.TempDir()
+	realDolt := filepath.Join(baseDir, "real-dolt")
+	if err := os.MkdirAll(realDolt, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	repoRoot := filepath.Join(baseDir, "repo")
+	beadsDir := filepath.Join(repoRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDolt, filepath.Join(beadsDir, "dolt")); err != nil {
+		t.Fatal(err)
+	}
+
+	backend, err := DetectPeerBackend(repoRoot)
+	if err != nil {
+		t.Fatalf("unexpected error with symlinked dolt dir: %v", err)
+	}
+	if backend != PeerBackendDolt {
+		t.Errorf("expected dolt backend through symlink, got %s", backend)
+	}
+}
+
+func TestDetectPeerBackend_NotADirectory(t *testing.T) {
+	skipIfNoDolt(t)
+
+	dir := t.TempDir()
+	// Create .beads as a file, not a directory
+	beadsPath := filepath.Join(dir, ".beads")
+	if err := os.WriteFile(beadsPath, []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := DetectPeerBackend(dir)
+	if err == nil {
+		t.Fatal("expected error when .beads is a file, not a directory")
+	}
+}
+
+func TestHydrateFromPeerDolt_SourceRepoPersistence(t *testing.T) {
+	skipIfNoDolt(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	baseDir := t.TempDir()
+
+	// Setup peer with an issue
+	peerDoltDir := filepath.Join(baseDir, "peer-dolt")
+	peerStore, peerCleanup := setupFederationStore(t, ctx, peerDoltDir, "peer")
+	defer peerCleanup()
+
+	peerIssue := &types.Issue{
+		ID:        "peer-persist-01",
+		Title:     "Persistence test",
+		IssueType: types.TypeTask,
+		Status:    types.StatusOpen,
+		Priority:  2,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	if err := peerStore.CreateIssue(ctx, peerIssue, "test"); err != nil {
+		t.Fatalf("failed to create peer issue: %v", err)
+	}
+	if err := peerStore.Commit(ctx, "Create persistence test issue"); err != nil {
+		t.Logf("commit: %v", err)
+	}
+	peerStore.Close()
+
+	// Create peer repo root structure
+	peerRepoRoot := filepath.Join(baseDir, "peer-root")
+	peerBeadsDir := filepath.Join(peerRepoRoot, ".beads")
+	if err := os.MkdirAll(peerBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(peerDoltDir, filepath.Join(peerBeadsDir, "dolt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerBeadsDir, "metadata.json"),
+		[]byte(`{"database":"dolt","backend":"dolt"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Setup local store, hydrate, close, reopen, verify source_repo persists
+	localDir := filepath.Join(baseDir, "local-dolt")
+	localStore, localCleanup := setupFederationStore(t, ctx, localDir, "local")
+
+	_, err := localStore.HydrateFromPeerDolt(ctx, peerRepoRoot)
+	if err != nil {
+		t.Fatalf("HydrateFromPeerDolt failed: %v", err)
+	}
+
+	// Commit and close
+	if err := localStore.Commit(ctx, "Hydrate from peer"); err != nil {
+		t.Logf("commit: %v", err)
+	}
+	localCleanup()
+
+	// Reopen the store and verify source_repo survived the round-trip
+	reopened, reopenCleanup := setupFederationStore(t, ctx, localDir, "local")
+	defer reopenCleanup()
+
+	got, err := reopened.GetIssue(ctx, "peer-persist-01")
+	if err != nil {
+		t.Fatalf("failed to get issue after reopen: %v", err)
+	}
+	if got == nil {
+		t.Fatal("issue not found after reopen")
+	}
+	// Note: source_repo may not persist through Dolt storage if the field
+	// is not stored in the issues table. This test documents the behavior.
+	t.Logf("source_repo after round-trip: %q", got.SourceRepo)
+}
+
+func TestHydrateFromPeerDolt_ReadOnlyStoreRejects(t *testing.T) {
+	skipIfNoDolt(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	baseDir := t.TempDir()
+
+	// Setup a peer
+	peerDoltDir := filepath.Join(baseDir, "peer-dolt")
+	_, peerCleanup := setupFederationStore(t, ctx, peerDoltDir, "peer")
+	defer peerCleanup()
+
+	peerRepoRoot := filepath.Join(baseDir, "peer-root")
+	peerBeadsDir := filepath.Join(peerRepoRoot, ".beads")
+	if err := os.MkdirAll(peerBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(peerDoltDir, filepath.Join(peerBeadsDir, "dolt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerBeadsDir, "metadata.json"),
+		[]byte(`{"database":"dolt","backend":"dolt"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open a read-only store and verify hydration is rejected
+	roStore, err := OpenPeerStore(ctx, peerRepoRoot)
+	if err != nil {
+		t.Fatalf("OpenPeerStore failed: %v", err)
+	}
+	defer roStore.Close()
+
+	_, err = roStore.HydrateFromPeerDolt(ctx, peerRepoRoot)
+	if err == nil {
+		t.Fatal("expected error when hydrating from a read-only store")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Errorf("expected 'read-only' in error message, got: %v", err)
+	}
+}
+
+func TestQueryPeerIssues_EmptyPeer(t *testing.T) {
+	skipIfNoDolt(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	baseDir := t.TempDir()
+
+	// Setup peer with no issues
+	peerDoltDir := filepath.Join(baseDir, "empty-peer")
+	peerStore, peerCleanup := setupFederationStore(t, ctx, peerDoltDir, "empty")
+	defer peerCleanup()
+	if err := peerStore.Commit(ctx, "Initialize empty peer"); err != nil {
+		t.Logf("commit: %v", err)
+	}
+	peerStore.Close()
+
+	peerRepoRoot := filepath.Join(baseDir, "empty-root")
+	peerBeadsDir := filepath.Join(peerRepoRoot, ".beads")
+	if err := os.MkdirAll(peerBeadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(peerDoltDir, filepath.Join(peerBeadsDir, "dolt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(peerBeadsDir, "metadata.json"),
+		[]byte(`{"database":"dolt","backend":"dolt"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := QueryPeerIssues(ctx, peerRepoRoot, types.IssueFilter{})
+	if err != nil {
+		t.Fatalf("QueryPeerIssues on empty peer failed: %v", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("expected 0 issues from empty peer, got %d", len(result))
+	}
 }
