@@ -672,6 +672,38 @@ var listCmd = &cobra.Command{
 			activeStore = rigStore
 		}
 
+		// Handle --repo flag: query a peer repository's database directly
+		repoOverride, _ := cmd.Flags().GetString("repo")
+		if repoOverride != "" {
+			// Expand ~ to home directory
+			if len(repoOverride) > 0 && repoOverride[0] == '~' {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					repoOverride = filepath.Join(home, repoOverride[1:])
+				}
+			}
+
+			peerBackend, err := dolt.DetectPeerBackend(repoOverride)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+
+			if peerBackend == dolt.PeerBackendDolt {
+				// Open peer Dolt database directly (read-only)
+				repoStore, err := dolt.OpenPeerStore(ctx, repoOverride)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+				defer func() { _ = repoStore.Close() }() // Best effort cleanup
+				activeStore = repoStore
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: peer at %s uses %s backend; --repo requires a Dolt-backed repository\n", repoOverride, peerBackend)
+				os.Exit(1)
+			}
+		}
+
 		// Direct mode
 		issues, err := activeStore.SearchIssues(ctx, "", filter)
 		if err != nil {
@@ -927,6 +959,9 @@ func init() {
 
 	// Cross-rig routing: query a different rig's database (bd-rgdjr)
 	listCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig gastown, --rig gt-, --rig gt)")
+
+	// Cross-repo routing: query a peer repository's Dolt database (bd-lb9)
+	listCmd.Flags().String("repo", "", "Query issues from a peer repository (path to peer's root, e.g., --repo ~/other-project)")
 
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)
