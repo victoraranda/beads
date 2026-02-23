@@ -61,6 +61,12 @@ environment variable.`,
 			// Non-fatal - continue with defaults
 		}
 
+		// Auto-migrate legacy SQLite database if present.
+		// If beads.db exists but no dolt/, migrate transparently before the
+		// existing-data safety check. After migration, checkExistingBeadsData
+		// will find the Dolt database and inform the user the workspace is ready.
+		checkAndAutoMigrateSQLite()
+
 		// Safety guard: check for existing beads data
 		// This prevents accidental re-initialization
 		if !force {

@@ -410,6 +410,10 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
+		// Auto-detect and migrate legacy SQLite database before database discovery.
+		// If beads.db exists but no dolt/ directory, migrate SQLite → Dolt transparently.
+		checkAndAutoMigrateSQLite()
+
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
