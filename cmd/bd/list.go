@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -715,6 +716,38 @@ var listCmd = &cobra.Command{
 			}
 		}
 
+		// Handle --repo flag: query a peer repository's database directly
+		repoOverride, _ := cmd.Flags().GetString("repo")
+		if repoOverride != "" {
+			if rigOverride != "" {
+				FatalError("--rig and --repo are mutually exclusive")
+			}
+
+			// Expand ~ to home directory
+			if repoOverride[0] == '~' {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					repoOverride = filepath.Join(home, repoOverride[1:])
+				}
+			}
+
+			peerBackend, err := dolt.DetectPeerBackend(repoOverride)
+			if err != nil {
+				FatalError("%v", err)
+			}
+
+			if peerBackend != dolt.PeerBackendDolt {
+				FatalError("peer at %s uses %s backend; --repo requires a Dolt-backed repository", repoOverride, peerBackend)
+			}
+
+			repoStore, err := dolt.OpenPeerStore(ctx, repoOverride)
+			if err != nil {
+				FatalError("%v", err)
+			}
+			defer func() { _ = repoStore.Close() }()
+			activeStore = repoStore
+		}
+
 		// Direct mode
 		issues, err := activeStore.SearchIssues(ctx, "", filter)
 		if err != nil {
@@ -972,6 +1005,9 @@ func init() {
 
 	// Cross-rig routing: query a different rig's database (bd-rgdjr)
 	listCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig gastown, --rig gt-, --rig gt)")
+
+	// Cross-repo routing: query a peer repository's Dolt database
+	listCmd.Flags().String("repo", "", "Query issues from a peer repository (path to peer's root, e.g., --repo ~/other-project)")
 
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)
