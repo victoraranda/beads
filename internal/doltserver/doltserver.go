@@ -137,8 +137,15 @@ func fallbackPort(beadsDir string) int {
 }
 
 // DerivePort computes a stable port from the beadsDir path.
-// Maps to range 13307–14306 to avoid common service ports.
+// Maps to range 13307–14306 (1000 ports) to avoid common service ports.
 // The port is deterministic: same path always yields the same port.
+//
+// The 1000-port hash space means collisions become likely around 9+
+// concurrent projects (~3.9% probability via the birthday paradox with
+// fnv32a % 1000). This is acceptable because reclaimPort() in Start()
+// detects when another project's server already occupies the derived
+// port and falls back gracefully — hash collisions cause a retry, not
+// a failure.
 func DerivePort(beadsDir string) int {
 	abs, err := filepath.Abs(beadsDir)
 	if err != nil {
@@ -248,8 +255,13 @@ func writePortFile(beadsDir string, port int) error {
 }
 
 // DefaultConfig returns config with sensible defaults.
-// Priority: env var > metadata.json > config.yaml / global config > Gas Town fixed port > DefaultDoltServerPort (3307).
-// Start() may further fall back to DerivePort if 3307 is occupied by another project.
+// Priority: env var > metadata.json > config.yaml / global config > port file > Gas Town fixed port > DerivePort.
+//
+// The port file (dolt-server.port) is written by Start() with the actual port
+// the server is listening on. Consulting it here ensures that commands
+// connecting to an already-running server use the correct port — even when
+// Start() fell back to DerivePort because another project occupied the default
+// port.
 func DefaultConfig(beadsDir string) *Config {
 	cfg := &Config{
 		BeadsDir: beadsDir,
@@ -264,18 +276,37 @@ func DefaultConfig(beadsDir string) *Config {
 		}
 	}
 
-	// Check if user configured an explicit port in metadata.json
-	if metaCfg, err := configfile.Load(beadsDir); err == nil && metaCfg != nil {
-		if metaCfg.DoltServerPort > 0 {
-			cfg.Port = metaCfg.DoltServerPort
-		}
+	// Check the port file (gitignored, local-only) — this is the primary
+	// persistent source. Start() writes the actual listening port here.
+	// Elevated to top priority (after env var) to prevent git-tracked values
+	// from causing cross-project data leakage (GH#2372).
+	if p := readPortFile(beadsDir); 0 < p {
+		cfg.Port = p
+		return cfg
 	}
 
 	// Check config.yaml / global config (~/.config/bd/config.yaml) (GH#2073)
+	// Note: project-level config.yaml dolt.port is git-tracked and could
+	// propagate to collaborators. Prefer the gitignored port file above.
 	if cfg.Port == 0 {
 		if p := config.GetYamlConfig("dolt.port"); p != "" {
 			if port, err := strconv.Atoi(p); err == nil && port > 0 {
 				cfg.Port = port
+			}
+		}
+	}
+
+	// Deprecated: metadata.json DoltServerPort is git-tracked and propagates
+	// to all contributors, causing cross-project data leakage (GH#2372).
+	// Emit a one-time warning but still use the value as a fallback so
+	// existing setups don't break silently.
+	if cfg.Port == 0 {
+		if metaCfg, err := configfile.Load(beadsDir); err == nil && metaCfg != nil {
+			if metaCfg.DoltServerPort > 0 {
+				fmt.Fprintf(os.Stderr, "Warning: dolt_server_port in metadata.json is deprecated (can cause cross-project data leakage).\n")
+				fmt.Fprintf(os.Stderr, "  The port file (.beads/dolt-server.port) is now the primary source.\n")
+				fmt.Fprintf(os.Stderr, "  Remove dolt_server_port from .beads/metadata.json to silence this warning.\n")
+				cfg.Port = metaCfg.DoltServerPort
 			}
 		}
 	}
@@ -285,12 +316,7 @@ func DefaultConfig(beadsDir string) *Config {
 		if os.Getenv("GT_ROOT") != "" {
 			cfg.Port = GasTownPort
 		} else {
-			// Use the canonical default port (3307) rather than a hash-derived
-			// port. This matches shared Homebrew Dolt servers and aligns with
-			// configfile.DefaultDoltServerPort. DerivePort was intended for
-			// per-project isolated servers, but in practice most users run a
-			// single shared server.
-			cfg.Port = configfile.DefaultDoltServerPort
+			cfg.Port = DerivePort(beadsDir)
 		}
 	}
 
@@ -471,6 +497,7 @@ func Start(beadsDir string) (*State, error) {
 		if errors.Is(reclaimErr, ErrPortOccupiedByOtherProject) {
 			// Another project's Dolt server is on the default port —
 			// use a hash-derived port for this project instead.
+			fmt.Fprintf(os.Stderr, "Port %d occupied by another project's Dolt server; falling back to port %d\n", actualPort, fallbackPort(beadsDir))
 			actualPort = fallbackPort(beadsDir)
 			adoptPID, reclaimErr = reclaimPort(cfg.Host, actualPort, beadsDir)
 			if reclaimErr != nil {
@@ -1008,6 +1035,37 @@ const DefaultIdleTimeout = 30 * time.Minute
 // MonitorCheckInterval is how often the idle monitor checks activity.
 const MonitorCheckInterval = 60 * time.Second
 
+// stopServerProcess stops the Dolt server process without touching the idle
+// monitor's own state. This is used by the idle monitor to avoid killing itself
+// when shutting down an idle server. It flushes the working set, gracefully
+// stops the server, and removes server state files (PID, port) but leaves the
+// monitor PID file and activity file intact so the monitor can continue running
+// as a watchdog.
+func stopServerProcess(beadsDir string) error {
+	state, err := IsRunning(beadsDir)
+	if err != nil {
+		return err
+	}
+	if !state.Running {
+		return nil // already stopped
+	}
+
+	// Flush uncommitted working set changes before stopping.
+	cfg := DefaultConfig(beadsDir)
+	if flushErr := FlushWorkingSet(cfg.Host, state.Port); flushErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not flush working set before stop: %v\n", flushErr)
+	}
+
+	if err := gracefulStop(state.PID, 5*time.Second); err != nil {
+		_ = os.Remove(pidPath(beadsDir))
+		_ = os.Remove(portPath(beadsDir))
+		return err
+	}
+	_ = os.Remove(pidPath(beadsDir))
+	_ = os.Remove(portPath(beadsDir))
+	return nil
+}
+
 // forkIdleMonitor starts the idle monitor as a detached process.
 // It runs `bd dolt idle-monitor --beads-dir=<dir>` in the background.
 // Under Gas Town, the idle monitor is not forked — the daemon handles lifecycle.
@@ -1090,8 +1148,14 @@ func ReadActivityTime(beadsDir string) time.Time {
 
 // RunIdleMonitor is the main loop for the idle monitor sidecar process.
 // It checks the activity file periodically and stops the server if idle
-// for longer than the configured timeout. If the server crashed but
-// activity is recent, it restarts it (watchdog behavior).
+// for longer than the configured timeout. After stopping an idle server,
+// the monitor continues running as a watchdog: if new activity appears
+// (e.g. a bd command calls EnsureRunning and touches the activity file),
+// the monitor restarts the server. The monitor only exits after an
+// additional full idle timeout passes with no new activity.
+//
+// If the server crashed but activity is recent, the monitor restarts it
+// (watchdog behavior).
 //
 // idleTimeout of 0 means monitoring is disabled (exits immediately).
 // Under Gas Town, exits immediately — the daemon handles server lifecycle.
@@ -1103,6 +1167,36 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 	if IsDaemonManagedFor(beadsDir) {
 		return
 	}
+
+	// Single-instance enforcement: acquire an exclusive lock on the monitor
+	// lock file. If another monitor is already running, exit immediately.
+	// This prevents the accumulation bug (GH#2367) where Start() called from
+	// within the monitor's watchdog restart would fork yet another monitor.
+	monitorLockPath := monitorPidPath(beadsDir) + ".lock"
+	var monitorLock *os.File
+	if f, err := os.OpenFile(monitorLockPath, os.O_CREATE|os.O_RDWR, 0600); err == nil { //nolint:gosec // G304: path derived from trusted beadsDir
+		if lockErr := lockfile.FlockExclusiveNonBlocking(f); lockErr != nil {
+			_ = f.Close()
+			return // another monitor holds the lock — exit silently
+		}
+		monitorLock = f
+	}
+	// Keep lock held for lifetime of this process. Clean up on exit.
+	defer func() {
+		_ = os.Remove(monitorPidPath(beadsDir))
+		if monitorLock != nil {
+			_ = lockfile.FlockUnlock(monitorLock)
+			_ = monitorLock.Close()
+			_ = os.Remove(monitorLockPath)
+		}
+	}()
+
+	// Write our PID now that we hold the lock
+	_ = os.WriteFile(monitorPidPath(beadsDir), []byte(strconv.Itoa(os.Getpid())), 0600)
+
+	// Tracks when we stopped the server for idle timeout. Zero means we
+	// haven't performed an idle shutdown (or the server was restarted since).
+	var idleShutdownAt time.Time
 
 	for {
 		time.Sleep(MonitorCheckInterval)
@@ -1116,14 +1210,37 @@ func RunIdleMonitor(beadsDir string, idleTimeout time.Duration) {
 		idleDuration := time.Since(lastActivity)
 
 		if state.Running {
+			idleShutdownAt = time.Time{} // server is up, clear idle-shutdown tracking
+
 			// Server is running — check if idle
 			if !lastActivity.IsZero() && idleDuration > idleTimeout {
-				// Idle too long — stop the server and exit
-				_ = Stop(beadsDir)
-				return
+				// Idle too long — stop the server but keep monitoring.
+				// Use stopServerProcess (not Stop) to avoid killing ourselves.
+				_ = stopServerProcess(beadsDir)
+				idleShutdownAt = time.Now()
 			}
 		} else {
-			// Server is NOT running — watchdog behavior
+			// Server is NOT running
+			if !idleShutdownAt.IsZero() {
+				// We stopped it for idle timeout. Check for new activity
+				// (e.g. EnsureRunning touched the activity file).
+				if !lastActivity.IsZero() && lastActivity.After(idleShutdownAt) {
+					// New activity since we stopped — restart
+					_, _ = Start(beadsDir)
+					idleShutdownAt = time.Time{}
+					continue
+				}
+				// No new activity yet. If we've been waiting longer than
+				// another full idle timeout since shutdown, give up and exit.
+				if time.Since(idleShutdownAt) > idleTimeout {
+					_ = os.Remove(monitorPidPath(beadsDir))
+					return
+				}
+				// Keep waiting for new activity
+				continue
+			}
+
+			// Server is down but we didn't stop it (crash or external stop)
 			if lastActivity.IsZero() || idleDuration > idleTimeout {
 				// No recent activity — just exit
 				_ = os.Remove(monitorPidPath(beadsDir))

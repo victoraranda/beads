@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -100,6 +101,36 @@ environment variable.`,
 		if !force {
 			if err := checkExistingBeadsData(prefix); err != nil {
 				FatalError("%v", err)
+			}
+		}
+
+		// Even with --force, warn about existing data and require confirmation
+		// unless --quiet is set (which indicates programmatic/test use).
+		// This prevents AI agents and users from accidentally destroying data.
+		if force && !quiet {
+			if count, err := countExistingIssues(prefix); err == nil && count > 0 {
+				fmt.Fprintf(os.Stderr, "\n%s Re-initializing will destroy the existing database.\n\n", ui.RenderWarn("WARNING:"))
+				fmt.Fprintf(os.Stderr, "  Existing issues: %d\n\n", count)
+				fmt.Fprintf(os.Stderr, "  This action CANNOT be undone. All issues, dependencies, and\n")
+				fmt.Fprintf(os.Stderr, "  Dolt commit history will be permanently lost.\n\n")
+				fmt.Fprintf(os.Stderr, "  Before proceeding, consider:\n")
+				fmt.Fprintf(os.Stderr, "    bd export > backup.jsonl    # Export issues to JSONL\n")
+				fmt.Fprintf(os.Stderr, "    bd dolt status              # Check if this is a server config issue\n\n")
+				if term.IsTerminal(int(os.Stdin.Fd())) {
+					fmt.Fprintf(os.Stderr, "Type 'destroy %d issues' to confirm: ", count)
+					scanner := bufio.NewScanner(os.Stdin)
+					scanner.Scan()
+					expected := fmt.Sprintf("destroy %d issues", count)
+					if strings.TrimSpace(scanner.Text()) != expected {
+						fmt.Fprintf(os.Stderr, "\nAborted. Database was NOT modified.\n")
+						os.Exit(1)
+					}
+				} else {
+					// Non-interactive (piped input, AI agent, etc.) — refuse
+					fmt.Fprintf(os.Stderr, "Refusing to destroy %d issues in non-interactive mode.\n", count)
+					fmt.Fprintf(os.Stderr, "Use 'bd export' to back up first, then use --quiet to skip this check.\n")
+					os.Exit(1)
+				}
 			}
 		}
 
@@ -449,6 +480,13 @@ environment variable.`,
 				cfg = configfile.DefaultConfig()
 			}
 
+			// Generate project identity UUID if not already set (GH#2372).
+			// This UUID is stored in both metadata.json and the database,
+			// and verified on every connection to detect cross-project leakage.
+			if cfg.ProjectID == "" {
+				cfg.ProjectID = generateProjectID()
+			}
+
 			// Always store backend explicitly in metadata.json
 			cfg.Backend = backend
 			// Metadata.json.database should point to the Dolt directory (not beads.db).
@@ -485,6 +523,13 @@ environment variable.`,
 			if err := cfg.Save(beadsDir); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create metadata.json: %v\n", err)
 				// Non-fatal - continue anyway
+			}
+
+			// Write project identity to database for cross-project verification (GH#2372)
+			if cfg.ProjectID != "" && store != nil {
+				if err := store.SetMetadata(ctx, "_project_id", cfg.ProjectID); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to write project ID to database: %v\n", err)
+				}
 			}
 
 			// Create config.yaml template (prefix is stored in DB, not config.yaml)
@@ -921,8 +966,9 @@ This workspace is already initialized.
 To use the existing database:
   Just run bd commands normally (e.g., %s)
 
-To force reinitialize (data loss warning):
-  bd init --force --prefix %s
+If the database is genuinely corrupt and unrecoverable:
+  bd export > backup.jsonl              # Back up first!
+  bd init --force --prefix %s           # Then reinitialize
 
 Aborting.`, ui.RenderWarn("⚠"), location, ui.RenderAccent("bd list"), prefix)
 		}
@@ -949,8 +995,9 @@ To use the existing database:
   Just run bd commands normally (e.g., %s)
   The redirect will route to the canonical database.
 
-To force reinitialize (data loss warning):
-  bd init --force --prefix %s
+If the database is genuinely corrupt and unrecoverable:
+  bd export > backup.jsonl              # Back up first!
+  bd init --force --prefix %s           # Then reinitialize
 
 Aborting.`, ui.RenderWarn("⚠"), redirectTarget, targetDBPath, ui.RenderAccent("bd list"), prefix)
 		}
@@ -968,13 +1015,44 @@ This workspace is already initialized.
 To use the existing database:
   Just run bd commands normally (e.g., %s)
 
-To force reinitialize (data loss warning):
-  bd init --force --prefix %s
+If the database is genuinely corrupt and unrecoverable:
+  bd export > backup.jsonl              # Back up first!
+  bd init --force --prefix %s           # Then reinitialize
 
 Aborting.`, ui.RenderWarn("⚠"), dbPath, ui.RenderAccent("bd list"), prefix)
 	}
 
 	return nil // No database found, safe to init
+}
+
+// countExistingIssues attempts to connect to the existing database and count
+// issues. Returns 0 if the database is unreachable or empty. Used by --force
+// safeguard to show users what they're about to destroy.
+func countExistingIssues(_ string) (int, error) {
+	beadsDir := ".beads"
+	if envBeadsDir := os.Getenv("BEADS_DIR"); envBeadsDir != "" {
+		beadsDir = utils.CanonicalizePath(envBeadsDir)
+	} else {
+		beadsDir = beads.FollowRedirect(beadsDir)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = store.Close() }()
+
+	stats, err := store.GetStatistics(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if stats == nil {
+		return 0, nil
+	}
+	return stats.TotalIssues, nil
 }
 
 // checkExistingBeadsData checks for existing database files
@@ -1104,6 +1182,19 @@ func promptContributorMode() (isContributor bool, err error) {
 
 // verifyMetadata writes a metadata field and verifies the write succeeded.
 // Returns true if write+verify succeeded, false with warning if either failed.
+// generateProjectID creates a UUID v4 for project identity verification.
+func generateProjectID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback: use timestamp + PID as a unique-enough identifier
+		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	}
+	// Set version (4) and variant (RFC 4122)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 func verifyMetadata(ctx context.Context, store *dolt.DoltStore, key, value string) bool {
 	if err := store.SetMetadata(ctx, key, value); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write %s metadata: %v\n", key, err)
