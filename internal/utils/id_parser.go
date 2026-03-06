@@ -90,6 +90,12 @@ func ResolvePartialID(ctx context.Context, store storage.Storage, input string) 
 	} else if hasKnownPrefix(input, knownPrefixes) {
 		// Starts with a known/allowed prefix (e.g., "hacker-news-ko4" when allowed_prefixes includes "hacker-news")
 		normalizedID = input
+	} else if strings.HasPrefix(input, "wisp-") {
+		// Wisp shorthand: "wisp-t3st" → "bd-wisp-t3st"
+		// The "wisp-" segment is part of the ID structure, not a cross-project prefix.
+		// Without this check, looksLikePrefixedID("wisp-t3st") returns true and treats
+		// "wisp" as a foreign project prefix, causing resolution to fail.
+		normalizedID = prefixWithHyphen + input
 	} else if looksLikePrefixedID(input) {
 		// Has a different prefix (e.g., "aap-4ar" when configured prefix is "hq-")
 		// Don't prepend configured prefix - use as-is for cross-prefix lookup (GH#1513)
