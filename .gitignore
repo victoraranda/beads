@@ -52,6 +52,7 @@ Thumbs.db
 .beads/.gitignore
 .beads/db.sqlite
 .beads/bd.db
+.beads/metadata.json
 
 # Beads database exports and backups belong on the beads-metadata branch,
 # not on main. The worktree at .beads/worktree handles commits to that branch.
