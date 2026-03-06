@@ -138,11 +138,21 @@ func startDoltContainer() error {
 	ctx, cancel := context.WithTimeout(context.Background(), serverStartTimeout)
 	defer cancel()
 
-	ctr, err := dolt.Run(ctx, DoltDockerImage,
+	ctr, runErr := dolt.Run(ctx, DoltDockerImage,
 		dolt.WithDatabase("beads_test"),
+		// Allow connections from the host (not just localhost inside the container).
+		// Required on macOS with Docker Desktop where the host connects via mapped port.
+		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
 	)
-	if err != nil {
-		return fmt.Errorf("starting Dolt container: %w", err)
+	if runErr != nil && ctr == nil {
+		return fmt.Errorf("starting Dolt container: %w", runErr)
+	}
+	// dolt.Run() may return a non-nil error from its internal "initialize" ping
+	// (Error 2012: No authentication methods available) on macOS with Docker Desktop,
+	// even though the container is running and accepting connections. If the container
+	// handle is non-nil, attempt to get the mapped port and proceed.
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "WARN: starting Dolt container: %v (container may still be usable)\n", runErr)
 	}
 
 	p, err := ctr.MappedPort(ctx, "3306/tcp")
@@ -187,8 +197,9 @@ func StartIsolatedDoltContainer(t *testing.T) string {
 	defer cancel()
 	ctr, err := dolt.Run(ctx, DoltDockerImage,
 		dolt.WithDatabase("beads_test"),
+		testcontainers.WithEnv(map[string]string{"DOLT_ROOT_HOST": "%"}),
 	)
-	if err != nil {
+	if err != nil && ctr == nil {
 		t.Fatalf("starting Dolt container: %v", err)
 	}
 	t.Cleanup(func() {

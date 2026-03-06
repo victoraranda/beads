@@ -48,3 +48,8 @@ types.custom: "agent,role,rig,convoy,slot,queue,event,message,molecule,gate,merg
 status.custom: "resolved"
 
 sync.mode: "dolt-native"
+
+# Shared Dolt server (Docker container serving all projects on this machine)
+dolt-server-host: 127.0.0.1
+dolt-server-port: 3307
+dolt-server-user: root

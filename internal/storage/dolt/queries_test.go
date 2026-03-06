@@ -615,7 +615,7 @@ func TestGetBlockedIssues_IncludesChildrenOfBlockedParents(t *testing.T) {
 		Title:     "Prerequisite",
 		Status:    types.StatusOpen,
 		Priority:  1,
-		IssueType: types.TypeTask,
+		IssueType: types.TypeEpic, // must match epic type for blocks dep
 	}
 	epic := &types.Issue{
 		ID:        "bi-epic",

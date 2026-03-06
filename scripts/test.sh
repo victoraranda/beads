@@ -16,6 +16,20 @@ if [[ "$(uname)" == "Darwin" ]]; then
         export CGO_CPPFLAGS="${CGO_CPPFLAGS:+$CGO_CPPFLAGS }-I${ICU_PREFIX}/include"
         export CGO_LDFLAGS="${CGO_LDFLAGS:+$CGO_LDFLAGS }-L${ICU_PREFIX}/lib"
     fi
+
+    # Docker Desktop on macOS uses a non-standard socket path.
+    # testcontainers-go requires DOCKER_HOST to point to the active socket.
+    if [[ -z "${DOCKER_HOST:-}" ]]; then
+        DOCKER_SOCK="/Users/$(whoami)/.docker/run/docker.sock"
+        if [[ -S "$DOCKER_SOCK" ]]; then
+            export DOCKER_HOST="unix://${DOCKER_SOCK}"
+        fi
+    fi
+
+    # Disable Ryuk (testcontainers reaper) to prevent cross-package container
+    # termination when running go test ./... in parallel. Each package manages
+    # its own container lifecycle via t.Cleanup().
+    export TESTCONTAINERS_RYUK_DISABLED=true
 fi
 
 # Build skip pattern from .test-skip file
@@ -127,7 +141,11 @@ if [[ "${BEADS_TEST_SHARED_SERVER:-}" == "1" && -z "${BEADS_DOLT_PORT:-}" ]]; th
 fi
 
 # Build go test command
-CMD=(go test -timeout "$TIMEOUT")
+# Run packages serially (-p 1) to prevent concurrent Docker container interference.
+# Multiple packages starting Dolt containers simultaneously can overwhelm the
+# Docker daemon and cause connection failures in the internal/storage/dolt tests.
+# Use -short to skip stress/slow tests that are better run via make test-full-cgo.
+CMD=(go test -timeout "$TIMEOUT" -p 1 -short)
 
 if [[ -n "$VERBOSE" ]]; then
     CMD+=(-v)

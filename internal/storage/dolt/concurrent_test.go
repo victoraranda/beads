@@ -195,6 +195,9 @@ func TestSameIssueUpdateRace(t *testing.T) {
 // =============================================================================
 
 func TestReadWriteMix(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow: concurrent read/write stress test")
+	}
 	store, cleanup := setupConcurrentTestStore(t)
 	defer cleanup()
 

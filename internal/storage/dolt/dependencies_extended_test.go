@@ -286,8 +286,8 @@ func TestGetDependencyTree(t *testing.T) {
 	ctx, cancel := testContext(t)
 	defer cancel()
 
-	// Create a simple tree: root -> child1, root -> child2
-	root := &types.Issue{ID: "tree-root", Title: "Root", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeEpic}
+	// Create a simple tree: root -> child1, root -> child2 (same type required for blocks dep)
+	root := &types.Issue{ID: "tree-root", Title: "Root", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask}
 	child1 := &types.Issue{ID: "tree-child1", Title: "Child 1", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
 	child2 := &types.Issue{ID: "tree-child2", Title: "Child 2", Status: types.StatusOpen, Priority: 2, IssueType: types.TypeTask}
 

@@ -53,6 +53,15 @@ Thumbs.db
 .beads/db.sqlite
 .beads/bd.db
 
+# Beads database exports and backups belong on the beads-metadata branch,
+# not on main. The worktree at .beads/worktree handles commits to that branch.
+.beads/issues.jsonl
+.beads/issues.jsonl.new
+.beads/backup/
+.beads/cost_state.json
+.beads/interactions.jsonl
+.beads/worktree/
+
 # Ignore nix result
 result
 
