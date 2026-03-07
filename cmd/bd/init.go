@@ -377,12 +377,20 @@ environment variable.`,
 
 		// Build config. Beads always uses dolt sql-server.
 		// AutoStart is always enabled during init — we need a server to initialize the database.
+		//
+		// Use doltserver.DefaultConfig to resolve the port via the standard chain
+		// (env var → port file → config.yaml → DerivePort). Without this, the
+		// store's applyConfigDefaults falls back to DefaultSQLPort (3307), which
+		// may belong to a DIFFERENT project's server, causing cross-project data
+		// leakage (GH#2372).
+		doltDefaults := doltserver.DefaultConfig(beadsDir)
 		doltCfg := &dolt.Config{
 			Path:            storagePath,
 			BeadsDir:        beadsDir,
 			Database:        dbName,
+			ServerPort:      doltDefaults.Port,
 			CreateIfMissing: true, // bd init is the only path that should create databases
-			AutoStart:       !doltserver.IsDaemonManaged() && os.Getenv("BEADS_DOLT_AUTO_START") != "0",
+			AutoStart:       os.Getenv("BEADS_DOLT_AUTO_START") != "0",
 		}
 		if serverHost != "" {
 			doltCfg.ServerHost = serverHost
@@ -952,6 +960,24 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 			doltDirExists = true
 		}
 		if doltDirExists || cfg.IsDoltServerMode() {
+			// For server mode, distinguish "DB exists" from "DB missing" (FR-010).
+			if cfg.IsDoltServerMode() && !doltDirExists {
+				host := cfg.GetDoltServerHost()
+				port := doltserver.DefaultConfig(beadsDir).Port
+				dbName := cfg.GetDoltDatabase()
+				password := cfg.GetDoltServerPassword()
+				user := cfg.GetDoltServerUser()
+
+				result := checkDatabaseOnServer(host, port, user, password, dbName)
+				if result.Reachable && !result.Exists && result.Err == nil {
+					// Server up but DB missing — show refined message (FR-010, FR-011).
+					gitRemote := config.GetString("sync.git-remote")
+					return initGuardServerMessage(dbName, host, port, prefix, gitRemote)
+				}
+				// If server unreachable (FR-030) or DB exists (FR-012) or
+				// error during check: fall through to existing behavior.
+			}
+
 			location := doltPath
 			if cfg.IsDoltServerMode() {
 				host := cfg.GetDoltServerHost()
